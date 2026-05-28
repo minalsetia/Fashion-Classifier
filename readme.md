@@ -1,0 +1,185 @@
+# 👕 Fashion Attribute Classification App
+
+An end-to-end application that scrapes clothing products from a fashion
+e-commerce site (Myntra), labels them for **gender** (male/female) and **sleeve type** (full/half), **fine-tunes a vision model** for each attribute via transfer
+learning, serves **single + batch predictions** through a Streamlit UI, and logs every prediction to a SQLite database.
+
+> The model is genuinely trained (transfer learning on a pretrained ResNet18) —
+> no zero-shot / API classification is used.
+
+---
+
+## 🧱 Architecture
+
+```
+Scrape (Myntra)  ->  Label (weak supervision)  ->  Train (2 ResNet18 models)
+      |                      |                              |
+  data/images/         data/labeled.csv            models/*.pt
+                                                          |
+                          Streamlit UI  <----  Inference (single + batch)
+                                |                         |
+                          view / predict          logs every run
+                                \_______________________ /
+                                            |
+                                      predictions.db (SQLite)
+```
+
+| File | Role |
+|------|------|
+| `src/config.py`   | Single source of truth: paths, labels, hyper-parameters |
+| `src/scraper.py`  | Scrape products, detail-page attributes + images from Myntra |
+| `src/labeler.py`  | Derive gender + sleeve labels (weak supervision) |
+| `src/database.py` | SQLite schema + log/fetch helpers (SQLAlchemy) |
+| `src/model.py`    | ResNet18 transfer-learning factory + image transforms |
+| `src/train.py`    | Fine-tune one model per task; reports accuracy + confusion matrix |
+| `src/predict.py`  | Single + batch inference; logs each run to the DB |
+| `app.py`          | Streamlit UI: Products, Single, Batch, History |
+
+---
+
+## ⚙️ Setup
+
+Requires **Python 3.10+**.
+
+```bash
+# 1. Create and activate a virtual environment
+python3 -m venv venv
+source venv/bin/activate          # Windows: venv\Scripts\activate
+
+# 2. Install dependencies
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+> **CPU-only / smaller download:** PyTorch's default wheel is large. For a
+> CPU-only machine you can install the lighter CPU build first:
+> `pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu`
+> then `pip install -r requirements.txt`.
+
+---
+
+## 🚀 Run the pipeline (in order)
+
+```bash
+# 1. Scrape ~500 products (images -> data/images, metadata -> data/metadata.csv)
+python -m src.scraper                 # or: python -m src.scraper --count 500
+
+# 2. Derive gender + sleeve labels -> data/labeled.csv
+python -m src.labeler
+
+# 3. Fine-tune both models -> models/gender_model.pt, models/sleeve_model.pt
+python -m src.train --task all        # or --task gender / --task sleeve
+
+# 4. Launch the UI
+streamlit run app.py
+```
+
+Quick CLI prediction (no UI):
+
+```bash
+python -m src.predict data/images/<id>.jpg
+python -m src.predict https://example.com/shirt.jpg https://example.com/tee.jpg
+```
+
+---
+
+## 🖥️ The UI
+
+Open the URL Streamlit prints (default http://localhost:8501). Pages:
+
+- **Products** — gallery of scraped items with their derived labels.
+- **Single Prediction** — upload an image, paste a URL, or pick a catalogue
+  item; see predicted gender + sleeve with confidence.
+- **Batch Prediction** — classify many uploads or catalogue items at once.
+- **History** — every logged prediction, read back from SQLite (downloadable CSV).
+
+---
+
+## 🗄️ Database
+
+SQLite file `predictions.db`, table `predictions` (image files are **not**
+stored — only tracking data, per the brief):
+
+| Column | Meaning |
+|--------|---------|
+| `id` | primary key |
+| `run_id` | groups the rows of one single/batch run |
+| `run_type` | `single` or `batch` |
+| `image_ref` | image URL or local path |
+| `predicted_gender` / `gender_confidence` | gender result + softmax confidence |
+| `predicted_sleeve` / `sleeve_confidence` | sleeve result + softmax confidence |
+| `model_version` | e.g. `resnet18_gender_v1+resnet18_sleeve_v1` |
+| `status` / `error_message` | `success`/`error` and any failure detail |
+| `timestamp` | UTC time of the run |
+
+---
+
+## 📝 Project Notes
+
+### Approach
+The project is a linear, inspectable pipeline — scrape → label → train →
+predict → UI — with one config file as the single source of truth and a SQLite
+DB recording every prediction. Labels are produced by **weak supervision**,
+sourced directly from Myntra so no manual labeling is needed: gender comes from
+the category/gender field, and sleeve type comes from the **structured "Sleeve
+Length" attribute on each product's detail page** (`Long Sleeves` → full,
+`Short Sleeves` → half; ambiguous items like *sleeveless*/*three-quarter* are
+dropped), with product-text keyword matching kept as a fallback. The scraper
+fetches those detail pages concurrently while collecting products.
+
+### Model choice
+**Transfer learning on a pretrained ResNet18.** With only a few hundred images,
+training a CNN from scratch would overfit badly; a backbone pretrained on
+ImageNet already encodes generic visual features, so we replace only the final
+layer and fine-tune (small learning rate on the backbone, larger on the new
+head). We train **two separate models** — one for gender, one for sleeve — which
+keeps each task simple to tune, debug and explain, at the cost of a little
+duplicated compute. ResNet18 is small enough to fine-tune on CPU.
+
+### Results
+Trained on the 500 scraped products (488 usable for gender, 418 for sleeve),
+ResNet18 backbone, 8 epochs, CPU, 80/20 stratified split.
+
+| Model | Best validation accuracy | Confusion matrix | Notes |
+|-------|--------------------------|------------------|-------|
+| Gender (female/male) | **1.00** (98 val images) | `[[58, 0], [0, 40]]` | men's vs women's product photos are highly separable; the small val set means this is likely a slight over-estimate |
+| Sleeve (full/half) | **0.92** (84 val images) | `[[41, 3], [4, 36]]` | the genuinely harder task; 7 errors / 84, balanced precision & recall (~0.91) |
+
+### Limitations
+- **Scraping fragility** — Myntra actively blocks bots; the scraper can be
+  rate-limited or 403'd (see Troubleshooting). Site HTML/API can change.
+- **Weak labels can be noisy** — sleeve labels rely on Myntra's own attribute
+  (usually accurate, occasionally mis-tagged); items with no/ambiguous sleeve
+  length are excluded, and `unisex` products are dropped from gender training.
+- **Limited & possibly imbalanced data** — ~500 images is small; class balance
+  depends on what the queries return.
+- **Narrow scope** — only tops have a meaningful sleeve attribute; only two
+  binary attributes are predicted.
+
+### Improvements with more time
+- A **multi-head model** (shared backbone, two heads) for efficiency, plus more
+  classes (sleeveless, 3/4) and more attributes (pattern, fit, neck).
+- Hand-label a gold validation set; add **k-fold CV, early stopping, LR
+  scheduling**, and class-weighting for imbalance.
+- A proper **FastAPI backend** + model registry/versioning, plus a Playwright
+  scraper with proxy rotation for robustness.
+
+---
+
+## 🛠️ Troubleshooting scraping
+
+Myntra may block automated requests (HTTP 403 / empty results). If scraping
+fails:
+
+1. **Run from a residential IP** (Myntra is most permissive from Indian IPs);
+   avoid datacenter/VPN ranges that are commonly blocked.
+2. **Slow down** — increase `SLEEP_BETWEEN_REQUESTS` in `src/config.py`.
+3. **Browser route** — if the JSON gateway is walled off, render category pages
+   with Playwright (`pip install playwright && playwright install chromium`) and
+   extract the embedded product JSON; the rest of the pipeline is unchanged as
+   long as it produces `data/metadata.csv` with the same columns.
+4. **Adjust queries** — edit `SCRAPE_QUERIES` in `src/config.py`.
+
+The pipeline downstream of scraping only needs a `data/metadata.csv` with
+columns: `product_id, brand, name, text_blob, gender_raw, category, price,
+search_query, image_url, product_url, image_path, sleeve_length`.
